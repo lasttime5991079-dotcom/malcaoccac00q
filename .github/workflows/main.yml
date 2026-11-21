@@ -1,0 +1,74 @@
+name: Sequential OBS Stream
+run-name: OBS Stream - Channel ${{ inputs.okru_stream_channel }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_urls:
+        description: Comma-separated authorized player URLs in failover order
+        required: true
+        type: string
+      okru_stream_channel:
+        description: OK.ru broadcast channel
+        required: true
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6', '7', '8']
+        default: '1'
+      stream_quality:
+        description: OBS output resolution and bitrate
+        required: true
+        type: choice
+        options: ['Original (1080p Max)', '1080p', '720p', '480p', '360p']
+        default: 'Original (1080p Max)'
+      custom_duration:
+        description: Run duration, such as 4h 30m, or None for the job limit
+        type: string
+        default: 'None'
+      video_selector:
+        description: Optional CSS selector for the authorized video element
+        type: string
+      server_selection:
+        description: Optional CSS selector for the authorized player or server button
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obs-stream
+  cancel-in-progress: false
+
+jobs:
+  stream:
+    runs-on: [self-hosted, linux, x64, obs-stream]
+    timeout-minutes: 7200
+
+    steps:
+      - name: Check out stream bot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run sequential stream bot
+        shell: bash
+        env:
+          TARGET_URLS: ${{ inputs.target_urls }}
+          OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
+          STREAM_QUALITY: ${{ inputs.stream_quality }}
+          CUSTOM_DURATION: ${{ inputs.custom_duration }}
+          VIDEO_SELECTOR: ${{ inputs.video_selector }}
+          SERVER_SELECTOR: ${{ inputs.server_selection }}
+          CHROME_PATH: ${{ vars.CHROME_PATH }}
+          STREAM_KEYS_FILE: ${{ vars.STREAM_KEYS_FILE }}
+          STREAM_INGEST_URL: ${{ secrets.OKRU_INGEST_URL }}
+          STREAM_KEY: ${{ secrets[format('OKRU_STREAM_KEY_{0}', inputs.okru_stream_channel)] }}
+        run: bash run-stream.sh
