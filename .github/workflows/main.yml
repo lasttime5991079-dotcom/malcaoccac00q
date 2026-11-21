@@ -1,34 +1,42 @@
-name: Sequential OBS Stream
+name: Pro Stream Bot (OBS Test)
 run-name: OBS Stream - Channel ${{ inputs.okru_stream_channel }}
 
 on:
   workflow_dispatch:
     inputs:
       target_urls:
-        description: Comma-separated authorized player URLs in failover order
+        description: Comma-separated authorized player URLs in order. Prefix a URL with ! for a 20s freeze threshold.
         required: true
         type: string
       okru_stream_channel:
-        description: OK.ru broadcast channel
+        description: OK.ru channel ID, such as 1, 1.11 or s2.10
         required: true
-        type: choice
-        options: ['1', '2', '3', '4', '5', '6', '7', '8']
+        type: string
         default: '1'
+      server_selection:
+        description: Player server button label, or None to skip
+        required: true
+        type: string
+        default: 'None'
       stream_quality:
         description: OBS output resolution and bitrate
         required: true
         type: choice
         options: ['Original (1080p Max)', '1080p', '720p', '480p', '360p']
         default: 'Original (1080p Max)'
+      proxy_engine:
+        description: Network connection for the authorized source
+        required: true
+        type: choice
+        options: ['None (Direct GitHub IP)']
+        default: 'None (Direct GitHub IP)'
       custom_duration:
-        description: Run duration, such as 4h 30m, or None for the job limit
+        description: Bot runtime, up to 5h 45m. Use None for 5h 45m.
+        required: true
         type: string
         default: 'None'
       video_selector:
-        description: Optional CSS selector for the authorized video element
-        type: string
-      server_selection:
-        description: Optional CSS selector for the authorized player or server button
+        description: Optional CSS selector for the intended video element
         type: string
 
 permissions:
@@ -39,11 +47,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  stream:
-    runs-on: [self-hosted, linux, x64, obs-stream]
-    timeout-minutes: 7200
+  stream-and-record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
+      - name: Select OK.ru channel
+        id: channel
+        shell: bash
+        env:
+          OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
+        run: |
+          channel=${OKRU_STREAM_ID,,}
+          channel_pattern='^([1-8]|1\.([1-9]|1[01])|2\.[12]|3\.[1-6]|4\.[1-5]|5\.[1-7]|s[12]\.([1-9]|10))$'
+          if [[ ! "$channel" =~ $channel_pattern ]]; then
+            echo 'Select a channel ID supported by the original stream bot.' >&2
+            exit 1
+          fi
+          secret_suffix=${channel^^}
+          printf 'id=%s\nsecret_name=OKRU_STREAM_KEY_%s\n' "$channel" "${secret_suffix//./_}" >> "$GITHUB_OUTPUT"
+
       - name: Check out stream bot
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,20 +78,116 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install OBS, Xvfb and PulseAudio
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            obs-studio pulseaudio pulseaudio-utils xvfb xauth fonts-dejavu-core
 
-      - name: Run sequential stream bot
+      - name: Prepare stable Google Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          chrome_path=$(command -v google-chrome || command -v google-chrome-stable || true)
+          if [[ -z "$chrome_path" ]]; then
+            chrome_deb="$RUNNER_TEMP/google-chrome-stable.deb"
+            curl --fail --show-error --silent --location --proto '=https' --retry 3 \
+              --output "$chrome_deb" \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$chrome_deb"
+            rm -f -- "$chrome_deb"
+            chrome_path=$(command -v google-chrome || command -v google-chrome-stable)
+          fi
+          "$chrome_path" --version
+          printf 'CHROME_PATH=%s\n' "$chrome_path" >> "$GITHUB_ENV"
+
+      - name: Install Node.js dependencies
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund --no-package-lock
+          fi
+
+      - name: Run OBS stream bot
         shell: bash
         env:
           TARGET_URLS: ${{ inputs.target_urls }}
-          OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
+          OKRU_STREAM_ID: ${{ steps.channel.outputs.id }}
+          SERVER_SELECTION: ${{ inputs.server_selection }}
           STREAM_QUALITY: ${{ inputs.stream_quality }}
+          PROXY_ENGINE: ${{ inputs.proxy_engine }}
           CUSTOM_DURATION: ${{ inputs.custom_duration }}
           VIDEO_SELECTOR: ${{ inputs.video_selector }}
-          SERVER_SELECTOR: ${{ inputs.server_selection }}
-          CHROME_PATH: ${{ vars.CHROME_PATH }}
-          STREAM_KEYS_FILE: ${{ vars.STREAM_KEYS_FILE }}
+          STREAM_MAX_MINUTES: '345'
           STREAM_INGEST_URL: ${{ secrets.OKRU_INGEST_URL }}
-          STREAM_KEY: ${{ secrets[format('OKRU_STREAM_KEY_{0}', inputs.okru_stream_channel)] }}
-        run: bash run-stream.sh
+          STREAM_KEY: ${{ secrets[steps.channel.outputs.secret_name] }}
+        run: |
+          set -euo pipefail
+
+          runtime_dir=$(mktemp -d /tmp/obs-stream.XXXXXXXX)
+          pulse_pid=''
+          stream_pid=''
+          cleanup() {
+            if [[ -n "$stream_pid" ]]; then
+              if [[ -f "$runtime_dir/stream.pid" ]]; then
+                kill -TERM "$(<"$runtime_dir/stream.pid")" 2>/dev/null || true
+                for attempt in {1..150}; do
+                  kill -0 "$stream_pid" 2>/dev/null || break
+                  sleep 0.2
+                done
+              fi
+              kill -TERM -- "-$stream_pid" 2>/dev/null || true
+              wait "$stream_pid" 2>/dev/null || true
+            fi
+            if [[ -n "$pulse_pid" ]]; then
+              kill -TERM "$pulse_pid" 2>/dev/null || true
+              wait "$pulse_pid" 2>/dev/null || true
+            fi
+            rm -rf -- "$runtime_dir"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          (umask 077; printf '%s\0' "${STREAM_INGEST_URL:-}" "${STREAM_KEY:-}" > "$runtime_dir/stream.env")
+          unset STREAM_INGEST_URL STREAM_KEY
+
+          export PULSE_RUNTIME_PATH="$runtime_dir"
+          export PULSE_STATE_PATH="$runtime_dir"
+          export PULSE_SERVER="unix:$runtime_dir/native"
+          export PULSE_SINK=obs_stream
+          export PULSE_SOURCE=obs_stream.monitor
+          export PULSE_COOKIE="$runtime_dir/cookie"
+          head -c 256 /dev/urandom > "$PULSE_COOKIE"
+          pulseaudio -n --daemonize=no \
+            --exit-idle-time=-1 --use-pid-file=no --log-level=error --log-target="file:$runtime_dir/pulse.log" \
+            --load="module-native-protocol-unix socket=$runtime_dir/native auth-cookie=$PULSE_COOKIE" \
+            --load="module-null-sink sink_name=$PULSE_SINK rate=48000 channels=2" &
+          pulse_pid=$!
+          for attempt in {1..30}; do
+            if pactl info >/dev/null 2>&1; then break; fi
+            if ! kill -0 "$pulse_pid" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          if ! pactl info >/dev/null 2>&1; then
+            echo 'Could not start the private PulseAudio server.' >&2
+            if [[ -f "$runtime_dir/pulse.log" ]]; then cat "$runtime_dir/pulse.log" >&2; fi
+            exit 1
+          fi
+
+          setsid xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24 -nolisten tcp' \
+            bash -e -c '
+              {
+                IFS= read -r -d "" STREAM_INGEST_URL
+                IFS= read -r -d "" STREAM_KEY
+              } < "$1/stream.env"
+              rm -f -- "$1/stream.env"
+              export STREAM_INGEST_URL STREAM_KEY
+              echo "$$" > "$1/stream.pid"
+              exec node stream.js
+            ' bash "$runtime_dir" &
+          stream_pid=$!
+          wait "$stream_pid"
